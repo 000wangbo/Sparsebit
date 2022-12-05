@@ -1,12 +1,9 @@
-import torch
 import torch.fx as fx
 import sys
 from enum import Enum
-from pathlib import Path
 
 from tabulate import tabulate
-from sparsebit.quantization.modules import *
-from sparsebit.quantization.quantizers import build_quantizer
+from sparsebit.quantization.modules import (Flatten, MaxPool2d, Reshape, Transpose, Concat, Permute, QIdentity, QReLU, QAdaptiveAvgPool2d, QConv2d, QConvTranspose2d, QLinear, QBatchNorm2d, QAdd, QSubtract, QMul, QDivide, QReLU6, QLeakyReLU, QSigmoid, QSiLU, QGELU, QMish)
 
 class ErrorCode(Enum):
     E001 = 1
@@ -63,7 +60,7 @@ class Validator:
         if isinstance(output_module, Flatten):
             return 1
         return 0
-    
+
     def wrap_lines(self, words, line_length):
         curr_line = ''
         warp_cnt = 0
@@ -90,8 +87,6 @@ class Validator:
             print("--No violation!--")
         else:
             print(strresult)
-        # if len(self.output) > 0:
-        #     sys.exit(1)
 
     def add_violation(self, layer_name, info, err):
         message = self.rules_quant.err_desc[err] + str(info),
@@ -101,14 +96,13 @@ class Validator:
             'ERROR',
             message
         ])
-    
+
     def ir_transform(self):
         named_modules = dict(self.model.model.named_modules(remove_duplicate=False))
-        modules_viewed = {}
         qnodes = []  # 用于避免重复遍历
         qnodes_invert = []
         # 给特定算子补上 input_quantizer
-        for n in  self.model.model.graph.nodes:
+        for n in self.model.model.graph.nodes:
             qnodes_invert.append(n)
             if not isinstance(n, fx.Node) or n in qnodes:
                 continue
@@ -121,8 +115,8 @@ class Validator:
                         new_module = QIdentity()
                         new_module.build_quantizer(self.qconfig)
                         self.model.model.add_module(new_module_name, new_module)
-                        with  self.model.model.graph.inserting_before(n):
-                            identity_node =  self.model.model.graph.create_node(
+                        with self.model.model.graph.inserting_before(n):
+                            identity_node = self.model.model.graph.create_node(
                                 op="call_module",
                                 target=new_module_name,
                                 args=(input_node,),
@@ -131,40 +125,36 @@ class Validator:
                             )
                         n.replace_input_with(input_node, identity_node)
         self.model.model.recompile()
-        
+
         # 按照算子规范拉齐算子输入输出以及了多个分支的 scale 的 ZP
         named_modules = dict(self.model.model.named_modules(remove_duplicate=False))
-        for n in  qnodes_invert[::-1]:
+        for n in qnodes_invert[::-1]:
             children = n._next
             if children.op != 'output':
                 if not isinstance(n, fx.Node) or n in qnodes:
                     continue
                 elif n.op == "call_module":
                     org_module = named_modules[n.target]
-                    if isinstance(org_module, (MaxPool2d, Flatten, Reshape, Transpose,  Permute)):
-                        children = n._next
+                    if isinstance(org_module, (MaxPool2d, Flatten, Reshape, Transpose, Permute)):
                         children_module = named_modules[n._next.target]
                         output_quantizer = children_module.input_quantizer
-                        parent = n._prev
                         parent_module = named_modules[n._prev.target]
                         parent_module.input_quantizer = output_quantizer
                     if isinstance(org_module, QReLU):
                         children = n.users
                         for idx, child in enumerate(children):
                             children_module = named_modules[child.target]
-                            if idx==0:
+                            if idx == 0:
                                 children_module = named_modules[n._next.target]
                                 output_quantizer = children_module.input_quantizer
                             else:
                                 children_module = named_modules[n._next.target]
                                 children_module.input_quantizer = output_quantizer
-            
         return self.model
-    
+
     def check_issue(self):
         named_modules = dict(self.model.model.named_modules(remove_duplicate=False))
         traced = self.model.model
-        modules_viewed = {}
         qnodes = []  # 用于避免重复遍历
         for n in traced.graph.nodes:
             if not isinstance(n, fx.Node) or n in qnodes:
@@ -182,10 +172,10 @@ class Validator:
                     else:
                         output_data_type = children_module.input_quantizer.qdesc._type
                         assert output_data_type in ['uint8', 'uint16'], "error in {} output data type".format(n.name)
-                    
+
                 elif isinstance(org_module, MaxPool2d):
                     pass
-                
+
                 elif isinstance(org_module, Concat):
                     pass
 
@@ -206,7 +196,7 @@ class Validator:
                     weight_data_type = org_module.weight_quantizer.qdesc._type
                     if weight_data_type not in ['int2', 'int4', 'int8']:
                         self.add_violation(n.name, weight_data_type, ErrorCode.E005)
-                        
+
                 elif isinstance(org_module, QConvTranspose2d):
                     input_data_type = org_module.input_quantizer.qdesc._type
                     if input_data_type not in ['uint4', 'uint8', 'uint16']:
@@ -224,7 +214,7 @@ class Validator:
                     weight_data_type = org_module.weight_quantizer.qdesc._type
                     if weight_data_type not in ['int2', 'int4', 'int8']:
                         self.add_violation(n.name, weight_data_type, ErrorCode.E005)
-                        
+
                 elif isinstance(org_module, QLinear):
                     input_data_type = org_module.input_quantizer.qdesc._type
                     if input_data_type not in ['uint4', 'uint8', 'uint16']:
@@ -243,15 +233,13 @@ class Validator:
                     weight_data_type = org_module.weight_quantizer.qdesc._type
                     if weight_data_type not in ['int2', 'int4', 'int8']:
                         self.add_violation(n.name, weight_data_type, ErrorCode.E005)
-                        
+
                 elif isinstance(org_module, QBatchNorm2d):
-                    parent = n._prev
                     parent_module = named_modules[n._prev.target]
                     if not isinstance(parent_module, (QConv2d, QConvTranspose2d, QLinear)):
                         self.add_violation(n.name, '', ErrorCode.E006)
-                    
+
                 elif isinstance(org_module, QReLU):
-                    parent = n._prev
                     parent_module = named_modules[n._prev.target]
                     if not isinstance(parent_module, (QConv2d, QConvTranspose2d, QLinear, QAdd)):
                         self.add_violation(n.name, '', ErrorCode.E007)
@@ -266,7 +254,7 @@ class Validator:
                         output_data_type = children_module.input_quantizer.qdesc._type
                         if output_data_type not in ['uint4', 'uint8', 'uint16', 'int4', 'int8', 'int16']:
                             self.add_violation(n.name, output_data_type, ErrorCode.E003)
-                            
+
                 elif isinstance(org_module, (QReLU6, QLeakyReLU, QSigmoid, QSiLU, QGELU, QMish)):
                     input_data_type = org_module.input_quantizer.qdesc._type
                     if input_data_type not in ['uint8', 'uint16']:
@@ -282,6 +270,7 @@ class Validator:
 
                 elif isinstance(org_module, (QAdd, QSubtract, QMul, QDivide)):
                     pass
-                
+
                 elif isinstance(org_module, (Flatten, Reshape, Transpose)):
                     pass
+        return
