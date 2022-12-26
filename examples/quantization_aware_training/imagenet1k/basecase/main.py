@@ -21,21 +21,14 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from sparsebit.quantization import QuantModel, parse_qconfig
+from sparsebit.quantization.validator import Validator
 import utils
-import third_party_models
 
 
 model_names = sorted(
     name
     for name in models.__dict__
     if name.islower() and not name.startswith("__") and callable(models.__dict__[name])
-)
-third_party_model_names = sorted(
-    name
-    for name in third_party_models.__dict__
-    if name.islower()
-    and not name.startswith("__")
-    and callable(third_party_models.__dict__[name])
 )
 
 parser = argparse.ArgumentParser(description="PyTorch ImageNet Training")
@@ -52,10 +45,8 @@ parser.add_argument(
     "--arch",
     metavar="ARCH",
     default="resnet18",
-    choices=model_names + third_party_model_names,
-    help="model architecture: "
-    + " | ".join(model_names + third_party_model_names)
-    + " (default: resnet18)",
+    choices=model_names,
+    help="model architecture: " + " | ".join(model_names) + " (default: resnet18)",
 )
 parser.add_argument(
     "-j",
@@ -66,7 +57,7 @@ parser.add_argument(
     help="number of data loading workers (default: 4)",
 )
 parser.add_argument(
-    "--epochs", default=90, type=int, metavar="N", help="number of total epochs to run"
+    "--epochs", default=1, type=int, metavar="N", help="number of total epochs to run"
 )
 parser.add_argument(
     "--start-epoch",
@@ -148,9 +139,42 @@ def main():
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose(
+    # train_dataset = datasets.ImageFolder(
+    #     traindir,
+    #     transforms.Compose(
+    #         [
+    #             transforms.RandomResizedCrop(224),
+    #             transforms.RandomHorizontalFlip(),
+    #             transforms.ToTensor(),
+    #             normalize,
+    #         ]
+    #     ),
+    # )
+    # calib_dataset = datasets.ImageFolder(
+    #     traindir,
+    #     transforms.Compose(
+    #         [
+    #             transforms.Resize(256),
+    #             transforms.CenterCrop(224),
+    #             transforms.ToTensor(),
+    #             normalize,
+    #         ]
+    #     ),
+    # )
+    # val_dataset = datasets.ImageFolder(
+    #     valdir,
+    #     transforms.Compose(
+    #         [
+    #             transforms.Resize(256),
+    #             transforms.CenterCrop(224),
+    #             transforms.ToTensor(),
+    #             normalize,
+    #         ]
+    #     ),
+    # )
+    from imagenet import DATASET
+    train_dataset = DATASET(
+        transform = transforms.Compose(
             [
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
@@ -158,10 +182,10 @@ def main():
                 normalize,
             ]
         ),
+        mode = 'train',
     )
-    calib_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose(
+    calib_dataset = DATASET(
+        transform = transforms.Compose(
             [
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
@@ -169,10 +193,10 @@ def main():
                 normalize,
             ]
         ),
+        mode = 'train',
     )
-    val_dataset = datasets.ImageFolder(
-        valdir,
-        transforms.Compose(
+    val_dataset = DATASET(
+        transform = transforms.Compose(
             [
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
@@ -180,6 +204,7 @@ def main():
                 normalize,
             ]
         ),
+        mode = 'validation',
     )
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -218,16 +243,10 @@ def main():
 
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
-        if args.arch in model_names:
-            model = models.__dict__[args.arch](pretrained=True)
-        else:
-            model = third_party_models.__dict__[args.arch](pretrained=True)
+        model = models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
-        if args.arch in model_names:
-            model = models.__dict__[args.arch]()
-        else:
-            model = third_party_models.__dict__[args.arch]()
+        model = models.__dict__[args.arch]()
 
     model.to(device)
     model = QuantModel(model, config=qconfig)
@@ -249,6 +268,12 @@ def main():
                 break
         model.init_QAT()
     print(model.model)
+    
+    ### validator
+    validator = Validator(model, qconfig)
+    validator.ir_transform()
+    validator.check_issue()
+    validator.pretty_print()
 
     model_without_ddp = model
     if args.distributed:
